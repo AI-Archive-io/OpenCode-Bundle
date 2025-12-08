@@ -1,0 +1,59 @@
+name: Build Windows Installer
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+jobs:
+  build-installer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+
+      - name: Get version from latest MCP-server release
+        id: version
+        run: |
+          # Get the latest release version from MCP-server
+          VERSION=$(curl -s https://api.github.com/repos/AI-Archive-io/MCP-server/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using MCP-server version: $VERSION"
+
+      - name: Download MCP binary for installer
+        run: |
+          mkdir -p dist
+          curl -L -o dist/ai-archive-mcp-win-x64.exe \
+            "https://github.com/AI-Archive-io/MCP-server/releases/latest/download/ai-archive-mcp-win-x64.exe"
+          ls -la dist/
+
+      - name: Build Windows Installer
+        run: |
+          makensis -DVERSION=${{ steps.version.outputs.version }} windows/installer-binary.nsi
+
+      - name: Verify installer created
+        run: |
+          ls -lh windows/AI-Archive-Bundle-Installer.exe || echo "Installer not found!"
+
+      - name: Upload installer as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Archive-Bundle-Installer.exe
+          path: windows/AI-Archive-Bundle-Installer.exe
+          retention-days: 30
+
+      - name: Upload installer to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            windows/AI-Archive-Bundle-Installer.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
