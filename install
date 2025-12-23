@@ -11,6 +11,21 @@ info() { echo -e "${GREEN}[$APP_NAME] $*${NC}"; }
 warn() { echo -e "${YELLOW}[$APP_NAME] $*${NC}"; }
 error() { echo -e "${RED}[$APP_NAME] $*${NC}" >&2; exit 1; }
 
+read_from_tty() {
+  local prompt="$1"
+  local var_name="$2"
+  # Check if TTY is available and usable (in Docker builds, /dev/tty may exist but fail)
+  if [ -t 0 ] && [ -c /dev/tty ]; then
+    read -p "$prompt" "$var_name" < /dev/tty 2>/dev/null || {
+      warn "TTY read failed (non-interactive mode). Skipping input for $var_name."
+      eval "$var_name=''"
+    }
+  else
+    warn "No TTY found (non-interactive mode). Skipping input for $var_name."
+    eval "$var_name=''"
+  fi
+}
+
 # -------- Detect OS/Arch -----------------------------------------------------
 
 OS="$(uname -s)"
@@ -24,7 +39,7 @@ esac
 
 case "$ARCH" in
   x86_64) ARCH="x64" ;;
-  aarch64) ARCH="arm64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
   *) error "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -34,6 +49,9 @@ OC_DIR="$HOME/.opencode/bin"
 MCP_DIR="$HOME/.ai-archive/bin"
 
 mkdir -p "$OC_DIR" "$MCP_DIR"
+
+# GitHub raw content base URL for downloading scripts
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/AI-Archive-io/OpenCode-Bundle/main"
 
 # -------- Check if OpenCode is already installed ----------------------------
 
@@ -47,14 +65,42 @@ fi
 
 if [ "$OPENCODE_INSTALLED" = false ]; then
   info "Downloading OpenCode binary..."
-  curl -L "https://github.com/sst/opencode/releases/latest/download/opencode-${OS}-${ARCH}.zip" -o oc.zip
-  unzip -qo oc.zip
-  mv opencode "$OC_DIR/"
+  
+  if [ "$OS" = "linux" ]; then
+    curl -L "https://github.com/sst/opencode/releases/latest/download/opencode-${OS}-${ARCH}.tar.gz" -o oc.tar.gz
+    tar -xzf oc.tar.gz
+    # Store the actual binary as opencode-bin (wrapper will be opencode)
+    mv opencode "$OC_DIR/opencode-bin"
+    rm oc.tar.gz
+  else
+    curl -L "https://github.com/sst/opencode/releases/latest/download/opencode-${OS}-${ARCH}.zip" -o oc.zip
+    unzip -qo oc.zip
+    # Store the actual binary as opencode-bin (wrapper will be opencode)
+    mv opencode "$OC_DIR/opencode-bin"
+    rm oc.zip
+  fi
+  
+  chmod +x "$OC_DIR/opencode-bin"
+  
+  # Download and install the opencode wrapper (syncs agents before starting)
+  info "Installing OpenCode wrapper with agent sync..."
+  curl -fsSL "$GITHUB_RAW_BASE/opencode-wrapper.sh" -o "$OC_DIR/opencode"
   chmod +x "$OC_DIR/opencode"
-  rm oc.zip
 else
   info "Skipping OpenCode download (already installed)."
+  # If upgrading, check if we need to set up the wrapper
+  if [ -f "$OC_DIR/opencode" ] && [ ! -f "$OC_DIR/opencode-bin" ]; then
+    info "Setting up wrapper for existing OpenCode installation..."
+    mv "$OC_DIR/opencode" "$OC_DIR/opencode-bin"
+    curl -fsSL "$GITHUB_RAW_BASE/opencode-wrapper.sh" -o "$OC_DIR/opencode"
+    chmod +x "$OC_DIR/opencode"
+  fi
 fi
+
+# Download sync-agents utility
+info "Installing agent sync utility..."
+curl -fsSL "$GITHUB_RAW_BASE/sync-agents.sh" -o "$MCP_DIR/sync-agents"
+chmod +x "$MCP_DIR/sync-agents"
 
 info "Downloading AI-Archive MCP binary from GitHub releases..."
 
@@ -109,13 +155,21 @@ fi
 
 # -------- Add PATH (only if we installed OpenCode) ----------------------------
 
+PATH_UPDATED=false
 if [ "$OPENCODE_INSTALLED" = false ]; then
-  SHELL_RC="$HOME/.zshrc" # adjust for bash if needed
+  # Detect correct RC file
+  if [[ "$SHELL" == */zsh ]]; then
+    SHELL_RC="$HOME/.zshrc"
+  elif [[ "$SHELL" == */bash ]]; then
+    SHELL_RC="$HOME/.bashrc"
+  else
+    SHELL_RC="$HOME/.bashrc" # Default fallback
+  fi
 
   if ! grep -q ".opencode/bin" "$SHELL_RC"; then
     echo "export PATH=\"\$HOME/.opencode/bin:\$HOME/.ai-archive/bin:\$PATH\"" >> "$SHELL_RC"
-    echo "alias opencode='opencode --agent science-researcher'" >> "$SHELL_RC"
-    info "PATH updated. Restart your terminal."
+    info "PATH updated in $SHELL_RC"
+    PATH_UPDATED=true
   fi
 else
   info "Skipping PATH update (OpenCode already in PATH)."
@@ -126,22 +180,7 @@ fi
 CFG_DIR="$HOME/.config/opencode"
 mkdir -p "$CFG_DIR"
 
-read -p "Enter your AI-Archive API key (optional): " API_KEY < /dev/tty
-
-# Generate AI-Archive MCP config snippet
-MCP_CONFIG=$(cat <<'MCCFG'
-{
-  "ai-archive-mcp": {
-    "type": "local",
-    "command": ["$MCP_DIR/ai-archive-mcp"],
-    "enabled": true,
-    "environment": {
-      "MCP_API_KEY": "$API_KEY"
-    }
-  }
-}
-MCCFG
-)
+read_from_tty "Enter your AI-Archive API key (optional): " API_KEY
 
 if [ "$OPENCODE_INSTALLED" = false ]; then
   # Fresh install: create complete config file
@@ -189,39 +228,55 @@ EOF
   warn "Specifically, add the 'ai-archive-mcp' entry under the 'mcp' section."
 fi
 
-# -------- Download Agent Documentation ----------------------------------------
+# -------- Sync Agents ---------------------------------------------------------
+# Now that we have the API key, sync agents from the platform
 
 AGENT_CFG_DIR="$CFG_DIR/agent"
 mkdir -p "$AGENT_CFG_DIR"
 
-info "Downloading agent documentation..."
+AGENTS_SYNCED=false
 
-# Fetch list of agent docs from the server directory listing
-AGENT_LIST=$(curl -fsSL "https://ai-archive.io/downloads/agent/" 2>/dev/null | grep -oP '(?<=href=")[^"]*\.md(?=")' || echo "")
+# If authenticated, try to fetch user's personal agents from the API
+if [ -n "$API_KEY" ]; then
+  info "Syncing your personal AI agents from AI-Archive..."
+  
+  # Run the sync-agents utility
+  if [ -x "$MCP_DIR/sync-agents" ]; then
+    export MCP_API_KEY="$API_KEY"
+    "$MCP_DIR/sync-agents" && AGENTS_SYNCED=true
+  fi
+fi
 
-if [ -z "$AGENT_LIST" ]; then
-  warn "Could not fetch agent documentation list. Directory listing may not be enabled."
-  warn "Please contact support if this issue persists."
-else
-  # Convert list to array to avoid stdin issues
-  mapfile -t AGENT_ARRAY <<< "$AGENT_LIST"
+# Fallback: Download default agents from GitHub if not synced from API
+if [ "$AGENTS_SYNCED" = false ]; then
+  info "Downloading default agent configurations..."
+  
+  # Download default agents from the OpenCode-Bundle repo
+  AGENT_FILES=("researcher.md" "reviewer.md")
   
   SUCCESS_COUNT=0
-  for doc in "${AGENT_ARRAY[@]}"; do
-    if [ -n "$doc" ]; then
-      if curl -fsSL "https://ai-archive.io/downloads/agent/$doc" -o "$AGENT_CFG_DIR/$doc" 2>/dev/null; then
-        info "  ✓ $doc"
-        ((SUCCESS_COUNT++)) || true
-      fi
+  for doc in "${AGENT_FILES[@]}"; do
+    if curl -fsSL "$GITHUB_RAW_BASE/agent/$doc" -o "$AGENT_CFG_DIR/$doc" 2>/dev/null; then
+      info "  ✓ $doc"
+      ((SUCCESS_COUNT++)) || true
     fi
   done
   
   if [ $SUCCESS_COUNT -gt 0 ]; then
-    info "Agent documentation installed to: $AGENT_CFG_DIR ($SUCCESS_COUNT files)"
+    info "Default agents installed to: $AGENT_CFG_DIR ($SUCCESS_COUNT files)"
+    info ""
+    info "💡 Tip: After registration, run 'sync-agents' or restart OpenCode"
+    info "        to sync your personal agents from AI-Archive."
   fi
-fi < /dev/tty
+fi
 
 # -------- Launch OpenCode -----------------------------------------------------
 
-info "Launch opencode by writing 'opencode'"
-# "$OC_DIR/opencode"
+if [ "$PATH_UPDATED" = "true" ]; then
+  info "Installation complete!"
+  info "To start using OpenCode immediately, run:"
+  echo -e "${YELLOW}  source $SHELL_RC${NC}"
+  info "Then command 'opencode' to launch."
+else
+  info "Installation complete! Launch OpenCode by writing 'opencode'"
+fi
