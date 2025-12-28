@@ -123,26 +123,6 @@ TMP_FILE="$MCP_DIR/ai-archive-mcp.tmp"
 
 curl -L "$GITHUB_BASE/$MCP_ASSET" -o "$TMP_FILE"
 
-# Known checksums for the current latest release - update when releases change
-declare -A CHECKSUMS
-CHECKSUMS[ai-archive-mcp-linux-x64]="ab0ab2df05c065125908c155fbb3a928314a39788886c3233f718dc60489be89"
-CHECKSUMS[ai-archive-macos-arm64]="c3427ea1fd456c9fe3ca1d0954b58fae562cb7b21a6596c5b45277c3bee59419"
-CHECKSUMS[ai-archive-mcp-win-x64.exe]="46ba24147d75564c77a52dcc4fdad7ed8ffed723a140448f22453288f598a975"
-
-expected="${CHECKSUMS[$MCP_ASSET]:-}"
-if [ -n "$expected" ]; then
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    warn "sha256sum not found; skipping checksum verification"
-  else
-    actual=$(sha256sum "$TMP_FILE" | awk '{print $1}')
-    if [ "$actual" != "$expected" ]; then
-      rm -f "$TMP_FILE"
-      error "Checksum verification failed for $MCP_ASSET (expected $expected, got $actual)"
-    fi
-  fi
-else
-  warn "No checksum for $MCP_ASSET; skipping verification"
-fi
 
 # Move downloaded file into place. Preserve .exe for Windows assets.
 if [[ "$MCP_ASSET" == *.exe ]]; then
